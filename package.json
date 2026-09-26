@@ -6,6 +6,7 @@
   "scripts": {
     "ingest": "node src/ingestion.js",
     "query": "node src/query.js",
+    "eval": "node src/evaluate.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
