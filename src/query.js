@@ -11,10 +11,48 @@ const openai = new OpenAI({
 });
 
 /**
- * Reciprocal Rank Fusion (RRF)
- * Merges multiple ranked lists into a unified list.
+ * 1. Query Rewriter
+ * Takes conversation history and the latest user query, then rewrites it
+ * into an unambiguous, self-contained search query.
  *
- * Formula: RRF_score(d) = Σ [ weight_i / (rank_i(d) + k) ]
+ * Resolves anaphoras and pronouns ("it", "they", "that", "its", "the device")
+ * using prior turns so hybrid search and BM25 can match keywords effectively.
+ */
+async function rewriteQuery(conversationHistory, latestQuery) {
+  if (!conversationHistory || conversationHistory.length === 0) {
+    return latestQuery;
+  }
+
+  const prompt = `
+You are a search query reformulation expert for a RAG retrieval system.
+Given the conversation history and a follow-up user query, rewrite the follow-up query into an independent, self-contained search query.
+
+Rules:
+1. Resolve all pronouns and ambiguous references ("it", "they", "its", "this setup", "that router") using details from the conversation.
+2. Include specific entity names, page numbers, technical terms, and acronyms mentioned earlier.
+3. Do NOT answer the question.
+4. Output ONLY the rewritten search query with no quotes, preamble, or commentary.
+5. If the query is already clear and self-contained, return it unchanged.
+
+Conversation History:
+${conversationHistory.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n")}
+
+User Follow-up Query: "${latestQuery}"
+Rewritten Standalone Query:`;
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const rewritten = response.choices[0].message.content.trim().replace(/^["']|["']$/g, "");
+  return rewritten;
+}
+
+/**
+ * 2. Reciprocal Rank Fusion (RRF)
+ * Merges multiple ranked lists into a unified list.
  */
 function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
   const docMap = new Map();
@@ -31,11 +69,7 @@ function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
       const key = `${source}::p${page}::${doc.pageContent.trim()}`;
 
       if (!docMap.has(key)) {
-        docMap.set(key, {
-          document: doc,
-          score: 0,
-          ranks: {},
-        });
+        docMap.set(key, { document: doc, score: 0, ranks: {} });
       }
 
       const entry = docMap.get(key);
@@ -50,24 +84,17 @@ function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
 }
 
 /**
- * LLM Cross-Encoder Reranker
- * Evaluates candidate chunks against the user query, scoring each on a 0-100 relevance scale.
- *
- * @param {string} query - The user query
- * @param {Array<Document>} candidates - Up to 50 candidates retrieved via hybrid search
- * @param {number} topK - Number of top documents to return after reranking
- * @returns {Promise<Array<Document>>} Top K reranked documents
+ * 3. Cross-Encoder Reranker
+ * Evaluates candidate chunks against the search query, assigning 0-100 relevance scores.
  */
 async function rerankCandidates(query, candidates, topK = 5) {
   if (!candidates || candidates.length === 0) return [];
 
-  console.log(`\n--- Reranker Stage ---`);
-  console.log(`Evaluating ${candidates.length} candidates against query: "${query}"...`);
+  console.log(`Evaluating ${candidates.length} candidates in Reranker against: "${query}"...`);
 
   const candidateExcerpts = candidates
     .map((doc, idx) => {
       const page = doc.metadata?.pageNumber ?? doc.metadata?.loc?.pageNumber ?? "?";
-      // Truncate to reasonable length to conserve tokens while preserving context
       const content = doc.pageContent.replace(/\s+/g, " ").trim().slice(0, 500);
       return `[Candidate ID ${idx}] (Page ${page}):\n${content}`;
     })
@@ -75,25 +102,22 @@ async function rerankCandidates(query, candidates, topK = 5) {
 
   const prompt = `
 You are an expert search relevance evaluator (Cross-Encoder Reranker).
-User Query: "${query}"
+Search Query: "${query}"
 
-Your task:
-Carefully evaluate each candidate passage and score its relevance to answering the user query.
-Assign an integer score between 0 and 100:
-- 90-100: Direct, comprehensive answer to the user query.
-- 60-89: Highly relevant context or partial answer.
-- 20-59: Tangentially related topic or keyword match with little answer value.
-- 0-19: Completely irrelevant or wrong topic.
+Score each candidate passage's relevance to answering the search query from 0 to 100:
+- 90-100: Direct, comprehensive answer.
+- 60-89: Highly relevant supporting context.
+- 20-59: Tangentially related topic or keyword match.
+- 0-19: Irrelevant or wrong topic.
 
 Respond ONLY with a JSON object in this exact schema:
 {
   "scores": [
-    { "id": 0, "score": 95, "reason": "Direct explanation of..." },
-    { "id": 1, "score": 10, "reason": "Unrelated topic" }
+    { "id": 0, "score": 95, "reason": "Direct description of..." }
   ]
 }
 
-Candidates to evaluate:
+Candidates:
 ${candidateExcerpts}
 `;
 
@@ -113,7 +137,6 @@ ${candidateExcerpts}
       }
     }
 
-    // Attach rerank scores and sort descending
     const scoredCandidates = candidates.map((doc, idx) => {
       const evaluation = scoreMap.get(idx) || { score: 0, reason: "No score assigned" };
       return {
@@ -125,27 +148,33 @@ ${candidateExcerpts}
 
     scoredCandidates.sort((a, b) => b.rerankScore - a.rerankScore);
 
-    console.log(`Reranking completed. Top ${Math.min(topK, scoredCandidates.length)} results:`);
+    console.log(`Top ${Math.min(topK, scoredCandidates.length)} after Reranking:`);
     scoredCandidates.slice(0, topK).forEach((item, i) => {
       const page = item.doc.metadata?.pageNumber ?? item.doc.metadata?.loc?.pageNumber;
-      console.log(
-        `#${i + 1} | Score: ${item.rerankScore}/100 | Page: ${page} | Reason: ${item.reason}`
-      );
+      console.log(`  #${i + 1} | Score: ${item.rerankScore}/100 | Page: ${page} | Reason: ${item.reason}`);
     });
 
     return scoredCandidates.slice(0, topK).map((item) => item.doc);
   } catch (error) {
-    console.warn("⚠️ Reranker error, falling back to original RRF candidate order:", error.message);
+    console.warn("⚠️ Reranker error, using RRF order:", error.message);
     return candidates.slice(0, topK);
   }
 }
 
-async function query(userQuery) {
-  console.log(`\n==================================================`);
-  console.log(`Query: "${userQuery}"`);
-  console.log(`==================================================\n`);
+/**
+ * 4. Main Conversational RAG Query Pipeline
+ */
+export async function askQuestion(userQuery, conversationHistory = []) {
+  console.log(`\n===============================================================`);
+  console.log(`Original User Query: "${userQuery}"`);
+  console.log(`Conversation History Length: ${conversationHistory.length} turns`);
 
-  // --- 1. Vector Search (Semantic) Setup ---
+  // Step 1: Query Rewriter
+  const searchReadyQuery = await rewriteQuery(conversationHistory, userQuery);
+  console.log(`Rewritten Search Query: "${searchReadyQuery}"`);
+  console.log(`---------------------------------------------------------------`);
+
+  // Step 2: Setup Hybrid Retrievers
   const embeddings = new OpenAIEmbeddings({
     modelName: "text-embedding-3-small",
     apiKey: process.env.OPENAI_API_KEY,
@@ -160,10 +189,8 @@ async function query(userQuery) {
     }),
   });
 
-  // Pull candidate pool (up to 50)
   const vectorStoreRetriever = vectorStore.asRetriever({ k: 50 });
 
-  // --- 2. BM25 Search (Keyword) Setup ---
   const pdfPath = "documents/cn.pdf";
   const loader = new PDFLoader(pdfPath);
   const rawDocs = await loader.load();
@@ -178,59 +205,80 @@ async function query(userQuery) {
 
   const bm25Retriever = BM25Retriever.fromDocuments(sanitizedDocuments, { k: 50 });
 
-  // --- 3. Parallel Hybrid Retrieval ---
-  console.log("Executing Hybrid Retrieval (Vector + BM25)...");
+  // Step 3: Hybrid Search (Vector + BM25) using rewritten query
+  console.log(`Executing Hybrid Search with: "${searchReadyQuery}"...`);
   const [vectorResults, bm25Results] = await Promise.all([
-    vectorStoreRetriever.invoke(userQuery),
-    bm25Retriever.invoke(userQuery),
+    vectorStoreRetriever.invoke(searchReadyQuery),
+    bm25Retriever.invoke(searchReadyQuery),
   ]);
 
-  console.log(`- Vector search returned: ${vectorResults.length} chunks`);
-  console.log(`- BM25 search returned: ${bm25Results.length} chunks`);
+  // Step 4: RRF Fusion -> Candidate pool
+  const candidatePool = reciprocalRankFusion([vectorResults, bm25Results], 60, [0.5, 0.5]).slice(0, 50);
+  console.log(`Candidate Pool size: ${candidatePool.length} chunks`);
 
-  // --- 4. Fusion (RRF) -> Candidate Pool (up to 50 candidates) ---
-  const fusedCandidates = reciprocalRankFusion(
-    [vectorResults, bm25Results],
-    60,
-    [0.5, 0.5]
-  );
-  const candidatePool50 = fusedCandidates.slice(0, 50);
-  console.log(`Total candidate pool after deduplicated RRF: ${candidatePool50.length} chunks`);
+  // Step 5: Reranker -> Top 5
+  const topContextDocs = await rerankCandidates(searchReadyQuery, candidatePool, 5);
 
-  // --- 5. Reranker Stage -> Top 5 ---
-  const top5Docs = await rerankCandidates(userQuery, candidatePool50, 5);
-
-  // --- 6. Generation with Final LLM ---
+  // Step 6: Final LLM Generation (incorporating conversation history + retrieved context)
   const SYSTEM_PROMPT = `
-    You are an expert in answering user query based on the provided context about document.
-    Do not answer anything beyond what is provided.
+You are an expert assistant answering questions based on the provided document context and conversation history.
+Do not hallucinate or answer outside the provided context.
+Always state the source document and page number where you found the answer.
 
-    Always also answer the user concisely and state which page number that content is available on and the name/source of the document.
+Context Documents:
+${topContextDocs
+  .map((doc) =>
+    JSON.stringify({
+      bookName: doc.metadata?.source,
+      pageContent: doc.pageContent,
+      pageNumber: doc.metadata?.pageNumber ?? doc.metadata?.loc?.pageNumber,
+    })
+  )
+  .join("\n\n")}
+`;
 
-    User Documents:
-    ${top5Docs
-      .map((e) =>
-        JSON.stringify({
-          bookName: e.metadata?.source,
-          pageContent: e.pageContent,
-          pageNumber: e.metadata?.pageNumber ?? e.metadata?.loc?.pageNumber,
-        })
-      )
-      .join("\n\n")}
-  `;
+  // Build message history for the final LLM response
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...conversationHistory,
+    { role: "user", content: userQuery },
+  ];
 
   const llmResponse = await openai.chat.completions.create({
     model: "gpt-6-luna",
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userQuery },
-    ],
+    messages: messages,
   });
 
-  console.log(`\n==================================================`);
-  console.log(`Final LLM Response:\n`, llmResponse.choices[0].message.content);
-  console.log(`==================================================\n`);
-  return llmResponse.choices[0].message.content;
+  const answer = llmResponse.choices[0].message.content;
+
+  console.log(`\nFinal LLM Response:\n${answer}`);
+  console.log(`===============================================================\n`);
+
+  return {
+    answer,
+    searchQuery: searchReadyQuery,
+    sources: topContextDocs.map((d) => ({
+      source: d.metadata?.source,
+      pageNumber: d.metadata?.pageNumber ?? d.metadata?.loc?.pageNumber,
+    })),
+  };
 }
 
-query("What is the main topic of the document page 2?");
+// Multi-turn Conversation Demo
+async function runDemo() {
+  const conversationHistory = [];
+
+  // Turn 1
+  const query1 = "What devices are being set up on page 2?";
+  const res1 = await askQuestion(query1, conversationHistory);
+  conversationHistory.push({ role: "user", content: query1 });
+  conversationHistory.push({ role: "assistant", content: res1.answer });
+
+  // Turn 2: Follow-up question with ambiguous pronoun "they"
+  const query2 = "How are they connected with each other?";
+  const res2 = await askQuestion(query2, conversationHistory);
+  conversationHistory.push({ role: "user", content: query2 });
+  conversationHistory.push({ role: "assistant", content: res2.answer });
+}
+
+runDemo();
