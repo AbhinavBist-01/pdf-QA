@@ -319,19 +319,18 @@ export async function askQuestion(userQuery, conversationHistory = []) {
 
   const chromaFilter = buildChromaFilter(filters);
 
-  const pdfPath = "documents/cn.pdf";
-  const loader = new PDFLoader(pdfPath);
-  const rawDocs = await loader.load();
-  const sanitizedDocuments = rawDocs.map((doc) => ({
-    ...doc,
-    metadata: {
-      source: String(doc.metadata?.source || pdfPath),
-      pageNumber: Number(doc.metadata?.loc?.pageNumber || 1),
-      totalPages: Number(doc.metadata?.pdf?.totalPages || 1),
-    },
-  }));
+  // Load multi-document chunks for BM25
+  let allDocuments = [];
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const raw = await readFile("documents/chunks.json", "utf8");
+    allDocuments = JSON.parse(raw);
+  } catch {
+    const loader = new PDFLoader("documents/cn.pdf");
+    allDocuments = await loader.load();
+  }
 
-  const eligibleBM25Docs = filterDocumentsForBM25(sanitizedDocuments, filters);
+  const eligibleBM25Docs = filterDocumentsForBM25(allDocuments, filters);
   const bm25Retriever = BM25Retriever.fromDocuments(eligibleBM25Docs, { k: 50 });
 
   // Execute Hybrid Search with the rewritten standalone query

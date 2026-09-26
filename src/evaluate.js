@@ -1,11 +1,11 @@
 import "dotenv/config";
 import { OpenAIEmbeddings } from "@langchain/openai";
-import { Chroma } from "@langchain/community/vectorstores/chroma";
-import { CloudClient } from "chromadb";
-import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
 import { BM25Retriever } from "@langchain/community/retrievers/bm25";
 import OpenAI from "openai";
 import { performance } from "node:perf_hooks";
+import { readFile } from "node:fs/promises";
+import { EVAL_DATASET } from "./dataset.js";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -13,83 +13,9 @@ const openai = new OpenAI({
 
 /**
  * ============================================================================
- * 1. EVALUATION BENCHMARK DATASET
+ * 1. RAG COMPONENTS & UTILITIES
  * ============================================================================
  */
-export const EVAL_DATASET = [
-  {
-    id: "q1_hardware_setup",
-    question: "What cable type and router interface are used to connect the PC in step 2?",
-    conversationHistory: [],
-    relevantPages: [2],
-    expectedAnswer:
-      "A Straight-Through cable connects the PC's FastEthernet interface to the router's GigabitEthernet0/0/0 interface.",
-  },
-  {
-    id: "q2_definition_aim",
-    question: "What does TELNET stand for and what is the aim of Experiment 5?",
-    conversationHistory: [],
-    relevantPages: [1],
-    expectedAnswer:
-      "TELNET stands for Teletype Network. The aim of Experiment 5 is to understand the operation of TELNET by accessing the router in a server room from a PC in IT Office.",
-  },
-  {
-    id: "q3_ip_configuration",
-    question: "What static IP address and default gateway are configured for the PC in step 3?",
-    conversationHistory: [],
-    relevantPages: [3],
-    expectedAnswer:
-      "The PC is configured with static IP 192.168.1.1 and default gateway 192.168.1.2.",
-  },
-  {
-    id: "q4_conversational_pronoun",
-    question: "What hostname change was verified in its final result?",
-    conversationHistory: [
-      { role: "user", content: "What is Experiment 5 about?" },
-      { role: "assistant", content: "Experiment 5 is about accessing a router via TELNET to configure it." },
-    ],
-    relevantPages: [5],
-    expectedAnswer:
-      "The hostname was changed from cnlab to cnlab2 using TELNET.",
-  },
-  {
-    id: "q5_metadata_filter",
-    question: "List the verification step described on page 4.",
-    conversationHistory: [],
-    relevantPages: [4],
-    expectedAnswer:
-      "Ping to verify the connection after entering the bold marked CLI commands.",
-  },
-];
-
-/**
- * ============================================================================
- * 2. SHARED PIPELINE UTILITIES
- * ============================================================================
- */
-function buildChromaFilter(filters) {
-  if (!filters || Object.keys(filters).length === 0) return undefined;
-  const entries = Object.entries(filters).filter(([_, v]) => v !== undefined && v !== null && v !== "");
-  if (entries.length === 0) return undefined;
-  if (entries.length === 1) return { [entries[0][0]]: entries[0][1] };
-  return { "$and": entries.map(([k, v]) => ({ [k]: v })) };
-}
-
-function filterDocumentsForBM25(docs, filters) {
-  if (!filters || Object.keys(filters).length === 0) return docs;
-  const entries = Object.entries(filters).filter(([_, v]) => v !== undefined && v !== null && v !== "");
-  if (entries.length === 0) return docs;
-
-  const matched = docs.filter((doc) => {
-    return entries.every(([key, value]) => {
-      const docVal = doc.metadata?.[key] ?? (key === "pageNumber" ? doc.metadata?.loc?.pageNumber : undefined);
-      if (docVal === undefined) return false;
-      if (typeof value === "string") return String(docVal).toLowerCase().includes(value.toLowerCase());
-      return docVal === value;
-    });
-  });
-  return matched.length > 0 ? matched : docs;
-}
 
 function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
   const docMap = new Map();
@@ -99,9 +25,7 @@ function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
     ranking.forEach((doc, rankIdx) => {
       const rank = rankIdx + 1;
       const rrfScore = weight / (rank + k);
-      const source = doc.metadata?.source || "unknown";
-      const page = doc.metadata?.pageNumber ?? doc.metadata?.loc?.pageNumber ?? 0;
-      const key = `${source}::p${page}::${doc.pageContent.trim()}`;
+      const key = `${doc.metadata?.fileName || doc.metadata?.source}::p${doc.metadata?.pageNumber}::${doc.pageContent.slice(0, 80).trim()}`;
 
       if (!docMap.has(key)) {
         docMap.set(key, { document: doc, score: 0 });
@@ -117,10 +41,10 @@ function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
 
 async function rewriteQuery(query, history = [], enableFilterExtraction = false) {
   const prompt = `
-You are a search query reformulation expert for a RAG system.
+You are an expert search query reformulation assistant.
 Given conversation history and the latest user query:
-1. "rewrittenQuery": Output a standalone search query. Resolve all ambiguous pronouns ("it", "they", "its", "that").
-2. "filters": ${enableFilterExtraction ? 'Extract explicit metadata filters like pageNumber (integer).' : 'Return {}'}.
+1. "rewrittenQuery": Output a standalone search query. Replace all ambiguous pronouns ("it", "they", "its", "that", "these", "that port", "that party", "him", "the king") with explicit entities from history.
+2. "filters": ${enableFilterExtraction ? 'Extract explicit metadata filters like pageNumber (integer) or fileName ("48 laws.pdf" or "cn.pdf").' : 'Return {}'}.
 
 Output JSON ONLY:
 {
@@ -151,12 +75,13 @@ Query: "${query}"
   }
 }
 
-async function rerank(query, candidates, topK = 5) {
+async function rerank(query, candidates, topK = 3) {
   if (!candidates || candidates.length === 0) return [];
   const candidateExcerpts = candidates
     .map((doc, idx) => {
-      const page = doc.metadata?.pageNumber ?? doc.metadata?.loc?.pageNumber ?? "?";
-      return `[ID ${idx}] (Page ${page}):\n${doc.pageContent.slice(0, 400)}`;
+      const file = doc.metadata?.fileName || doc.metadata?.source || "?";
+      const page = doc.metadata?.pageNumber ?? "?";
+      return `[ID ${idx}] (${file}, Page ${page}):\n${doc.pageContent.slice(0, 300)}`;
     })
     .join("\n\n");
 
@@ -191,7 +116,7 @@ async function compress(query, documents) {
   if (!documents || documents.length === 0) return [];
   const prompt = `
 User Query: "${query}"
-Extract ONLY exact facts directly answering the query from each chunk. Discard fluff. If none, return null.
+Extract ONLY exact factual statements, parameters, or instructions directly answering the query from each chunk. Discard fluff. If a chunk contains no answer, return null for it.
 Return JSON: {"compressedChunks": [{"id": 0, "compressedContent": "..."}]}
 
 Chunks:
@@ -226,19 +151,18 @@ ${documents.map((d, i) => `[ID ${i}]:\n${d.pageContent}`).join("\n\n")}
 
 /**
  * ============================================================================
- * 3. EVALUATION METRICS EVALUATOR (LLM-as-a-Judge & Citation/Ranking Verification)
+ * 2. METRICS EVALUATORS
  * ============================================================================
  */
 async function evaluateAnswerCorrectness(question, generatedAnswer, expectedAnswer) {
   const prompt = `
-You are an expert judge evaluating RAG answer accuracy.
+You are an expert judge evaluating RAG answer accuracy against ground truth.
 Question: "${question}"
-Ground Truth Expected Answer: "${expectedAnswer}"
+Ground Truth: "${expectedAnswer}"
 Generated Answer: "${generatedAnswer}"
 
-Score the answer correctness from 0 to 100 based on factual alignment with the ground truth.
-Return JSON ONLY:
-{"score": 95, "reason": "Explanation"}
+Score factual correctness from 0 to 100 based on alignment with ground truth.
+Return JSON ONLY: {"score": 95}
 `;
 
   try {
@@ -256,40 +180,41 @@ Return JSON ONLY:
 }
 
 function evaluateCitationCorrectness(generatedAnswer, relevantPages) {
-  const pageMatches = [...generatedAnswer.matchAll(/page\s*(\d+)/gi)].map((m) => Number(m[1]));
+  const pageMatches = [...generatedAnswer.matchAll(/page[s]?\s*(\d+)/gi)].map((m) => Number(m[1]));
   if (pageMatches.length === 0) return 0;
-  const validCitations = pageMatches.filter((p) => relevantPages.includes(p));
-  return validCitations.length > 0 ? 1 : 0;
+  return pageMatches.some((p) => relevantPages.includes(p)) ? 1 : 0;
 }
 
-function computeRankingMetrics(retrievedDocs, relevantPages) {
-  const retrievedPageNumbers = retrievedDocs.map(
-    (d) => d.metadata?.pageNumber ?? d.metadata?.loc?.pageNumber
-  );
-
-  // Recall@K: Did we retrieve ANY of the relevant pages in top K?
-  const hasRelevant = retrievedPageNumbers.some((p) => relevantPages.includes(p));
-  const recallAtK = hasRelevant ? 1 : 0;
-
-  // MRR: 1 / rank of first relevant page
+function computeRankingMetrics(retrievedDocs, targetFile, relevantPages) {
+  let hasRelevant = false;
   let mrr = 0;
-  for (let i = 0; i < retrievedPageNumbers.length; i++) {
-    if (relevantPages.includes(retrievedPageNumbers[i])) {
-      mrr = 1 / (i + 1);
-      break;
+
+  for (let i = 0; i < retrievedDocs.length; i++) {
+    const d = retrievedDocs[i];
+    const docFile = d.metadata?.fileName || d.metadata?.source || "";
+    const docPage = d.metadata?.pageNumber;
+
+    const fileMatches = !targetFile || docFile.toLowerCase().includes(targetFile.toLowerCase());
+    const pageMatches = !relevantPages || relevantPages.length === 0 || relevantPages.includes(docPage);
+
+    if (fileMatches && pageMatches) {
+      if (!hasRelevant) {
+        hasRelevant = true;
+        mrr = 1 / (i + 1);
+      }
     }
   }
 
-  return { recallAtK, mrr, retrievedPageNumbers };
+  return { recall: hasRelevant ? 1 : 0, mrr };
 }
 
 /**
  * ============================================================================
- * 4. CONFIGURABLE PIPELINE RUNNER (ABLATION SUITE)
+ * 3. PIPELINE RUNNER
  * ============================================================================
  */
 async function runRAGPipeline(testItem, config, resources) {
-  const { vectorStore, allDocs } = resources;
+  const { vectorStore, chunks } = resources;
   const startTime = performance.now();
 
   let activeQuery = testItem.question;
@@ -306,31 +231,44 @@ async function runRAGPipeline(testItem, config, resources) {
     activeFilters = rewriteRes.filters;
   }
 
-  const chromaFilter = config.useFilters ? buildChromaFilter(activeFilters) : undefined;
+  // Filter function for metadata
+  const matchesFilter = (doc) => {
+    if (!config.useFilters) return true;
+    if (activeFilters.pageNumber !== undefined && doc.metadata?.pageNumber !== activeFilters.pageNumber) {
+      return false;
+    }
+    if (activeFilters.fileName && !doc.metadata?.fileName?.toLowerCase().includes(activeFilters.fileName.toLowerCase())) {
+      return false;
+    }
+    return true;
+  };
 
   let retrievedDocs = [];
 
   // 2. Retrieval
   if (config.useHybrid) {
-    const eligibleBM25Docs = config.useFilters ? filterDocumentsForBM25(allDocs, activeFilters) : allDocs;
-    const bm25Retriever = BM25Retriever.fromDocuments(eligibleBM25Docs, { k: config.retrieveK || 50 });
+    const eligibleChunks = chunks.filter(matchesFilter);
+    const targetPool = eligibleChunks.length > 0 ? eligibleChunks : chunks;
+    const bm25 = BM25Retriever.fromDocuments(targetPool, { k: 25 });
+
     const [vecResults, bm25Results] = await Promise.all([
-      vectorStore.similaritySearch(activeQuery, config.retrieveK || 50, chromaFilter),
-      bm25Retriever.invoke(activeQuery),
+      vectorStore.similaritySearch(activeQuery, 25),
+      bm25.invoke(activeQuery),
     ]);
+
     retrievedDocs = reciprocalRankFusion([vecResults, bm25Results], 60, [0.5, 0.5]);
   } else {
-    // Baseline: pure vector search
-    retrievedDocs = await vectorStore.similaritySearch(activeQuery, 5, chromaFilter);
+    // Baseline: Dense Vector Search only (k=3)
+    retrievedDocs = await vectorStore.similaritySearch(activeQuery, 3);
   }
 
-  // Measure ranking quality before post-processing
-  const { recallAtK, mrr, retrievedPageNumbers } = computeRankingMetrics(retrievedDocs.slice(0, 5), testItem.relevantPages);
+  // Measure ranking metrics at top 3
+  const { recall, mrr } = computeRankingMetrics(retrievedDocs.slice(0, 3), testItem.targetFile, testItem.relevantPages);
 
   // 3. Reranker
-  let candidateDocs = retrievedDocs.slice(0, 5);
+  let candidateDocs = retrievedDocs.slice(0, 3);
   if (config.useReranker) {
-    candidateDocs = await rerank(activeQuery, retrievedDocs.slice(0, 50), 5);
+    candidateDocs = await rerank(activeQuery, retrievedDocs.slice(0, 25), 3);
   }
 
   // 4. Contextual Compression
@@ -339,20 +277,19 @@ async function runRAGPipeline(testItem, config, resources) {
     contextDocs = await compress(activeQuery, candidateDocs);
   }
 
-  // Measure context character footprint (token proxy)
   const contextChars = contextDocs.reduce((acc, d) => acc + d.pageContent.length, 0);
 
   // 5. LLM Answer Generation
   const prompt = `
-Answer the query based ONLY on the context below. State the page number citation.
+Answer based ONLY on the context below. Always cite the document and page number.
 Context:
-${contextDocs.map((d) => `Page ${d.metadata?.pageNumber ?? d.metadata?.loc?.pageNumber}: ${d.pageContent}`).join("\n\n")}
+${contextDocs.map((d) => `[${d.metadata?.fileName || d.metadata?.source}, Page ${d.metadata?.pageNumber}]: ${d.pageContent}`).join("\n\n")}
 
 Question: ${testItem.question}
 `;
 
   const messages = [
-    { role: "system", content: "You are a factual assistant. Cite page numbers." },
+    { role: "system", content: "You are a concise, factual assistant. Always cite source and page numbers." },
     ...(config.useQueryRewrite ? testItem.conversationHistory : []),
     { role: "user", content: prompt },
   ];
@@ -366,7 +303,6 @@ Question: ${testItem.question}
   const generatedAnswer = llmRes.choices[0].message.content;
   const latency = Math.round(performance.now() - startTime);
 
-  // Evaluate generated answer
   const answerCorrectness = await evaluateAnswerCorrectness(
     testItem.question,
     generatedAnswer,
@@ -375,7 +311,7 @@ Question: ${testItem.question}
   const citationCorrectness = evaluateCitationCorrectness(generatedAnswer, testItem.relevantPages);
 
   return {
-    recallAtK,
+    recall,
     mrr,
     answerCorrectness,
     citationCorrectness,
@@ -387,44 +323,48 @@ Question: ${testItem.question}
 
 /**
  * ============================================================================
- * 5. BENCHMARK SUITE EXECUTION & REPORTING
+ * 4. BENCHMARK SUITE EXECUTION & REPORTING
  * ============================================================================
  */
 async function main() {
   console.log("======================================================================");
-  console.log("            RAG EVALUATION & ABLATION BENCHMARK HARNESS               ");
+  console.log("      COMPREHENSIVE MULTI-DOCUMENT RAG BENCHMARK & ABLATION STUDY     ");
   console.log("======================================================================\n");
-  console.log(`Test Dataset: ${EVAL_DATASET.length} representative test cases`);
 
-  // Initialize resources
+  const args = process.argv.slice(2);
+  const limitArgIdx = args.indexOf("--limit");
+  const categoryArgIdx = args.indexOf("--category");
+
+  let testDataset = EVAL_DATASET;
+  if (categoryArgIdx !== -1 && args[categoryArgIdx + 1]) {
+    const targetCat = args[categoryArgIdx + 1].toLowerCase();
+    testDataset = testDataset.filter((t) => t.category.toLowerCase().includes(targetCat));
+  }
+  if (limitArgIdx !== -1 && args[limitArgIdx + 1]) {
+    const limit = parseInt(args[limitArgIdx + 1], 10);
+    if (!isNaN(limit)) testDataset = testDataset.slice(0, limit);
+  }
+
+  console.log(`Corpus: documents/48 laws.pdf (651 pages) + documents/cn.pdf (5 pages)`);
+  console.log(`Evaluating ${testDataset.length} queries across ${new Set(testDataset.map((d) => d.category)).size} categories.\n`);
+
+  // Load cached multi-document chunks
+  console.log("Loading multi-document chunks from cache...");
+  const rawData = await readFile("documents/chunks.json", "utf8");
+  const chunks = JSON.parse(rawData);
+  console.log(`Loaded ${chunks.length} chunks into memory.`);
+
+  console.log("Indexing chunks into high-speed vector store...");
   const embeddings = new OpenAIEmbeddings({
     modelName: "text-embedding-3-small",
     apiKey: process.env.OPENAI_API_KEY,
   });
 
-  const vectorStore = await Chroma.fromExistingCollection(embeddings, {
-    collectionName: "pdf-qa",
-    index: new CloudClient({
-      apiKey: process.env.CHROMADB_API_KEY,
-      tenant: "ae7af065-af71-456d-8c9c-3127e359d578",
-      database: "pdf-qa",
-    }),
-  });
+  const vectorStore = await MemoryVectorStore.fromDocuments(chunks, embeddings);
+  console.log("Vector store ready.\n");
 
-  const pdfLoader = new PDFLoader("documents/cn.pdf");
-  const rawDocs = await pdfLoader.load();
-  const allDocs = rawDocs.map((doc) => ({
-    ...doc,
-    metadata: {
-      source: "documents/cn.pdf",
-      pageNumber: Number(doc.metadata?.loc?.pageNumber || 1),
-      totalPages: Number(doc.metadata?.pdf?.totalPages || 1),
-    },
-  }));
+  const resources = { vectorStore, chunks };
 
-  const resources = { vectorStore, allDocs };
-
-  // Define ablation configurations
   const ablationConfigs = [
     {
       name: "1. Baseline (Vector Only)",
@@ -435,7 +375,7 @@ async function main() {
       useCompression: false,
     },
     {
-      name: "2. + Hybrid (Vector+BM25)",
+      name: "2. + Hybrid (Vector + BM25)",
       useHybrid: true,
       useReranker: false,
       useQueryRewrite: false,
@@ -476,10 +416,11 @@ async function main() {
     },
   ];
 
-  const summaryResults = [];
+  const overallResults = [];
+  const categoryBreakdown = {};
 
   for (const config of ablationConfigs) {
-    console.log(`\nEvaluating Configuration: [${config.name}]...`);
+    console.log(`\n>>> Evaluating [${config.name}] on ${testDataset.length} queries...`);
     const metrics = {
       recalls: [],
       mrrs: [],
@@ -489,40 +430,68 @@ async function main() {
       contextSizes: [],
     };
 
-    for (const testItem of EVAL_DATASET) {
-      process.stdout.write(`  - Running query: "${testItem.id}"... `);
-      const res = await runRAGPipeline(testItem, config, resources);
-      metrics.recalls.push(res.recallAtK);
+    let count = 0;
+    for (const item of testDataset) {
+      count++;
+      const res = await runRAGPipeline(item, config, resources);
+      metrics.recalls.push(res.recall);
       metrics.mrrs.push(res.mrr);
       metrics.correctnessScores.push(res.answerCorrectness);
       metrics.citationScores.push(res.citationCorrectness);
       metrics.latencies.push(res.latency);
       metrics.contextSizes.push(res.contextChars);
-      console.log(`OK (${res.latency}ms, recall=${res.recallAtK}, correct=${res.answerCorrectness})`);
+
+      if (!categoryBreakdown[item.category]) categoryBreakdown[item.category] = {};
+      if (!categoryBreakdown[item.category][config.name]) {
+        categoryBreakdown[item.category][config.name] = { recalls: [], mrrs: [] };
+      }
+      categoryBreakdown[item.category][config.name].recalls.push(res.recall);
+      categoryBreakdown[item.category][config.name].mrrs.push(res.mrr);
+
+      if (count % 5 === 0 || count === testDataset.length) {
+        process.stdout.write(`  [${count}/${testDataset.length} queries completed]\n`);
+      }
     }
 
     const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
-    const row = {
+    overallResults.push({
       Configuration: config.name,
-      "Recall@5": `${Math.round(avg(metrics.recalls) * 100)}%`,
+      "Recall@3": `${Math.round(avg(metrics.recalls) * 100)}%`,
       MRR: avg(metrics.mrrs).toFixed(3),
       "Answer Correctness": `${Math.round(avg(metrics.correctnessScores))}%`,
       "Citation Accuracy": `${Math.round(avg(metrics.citationScores) * 100)}%`,
       "Avg Latency": `${Math.round(avg(metrics.latencies))}ms`,
       "Context Chars": Math.round(avg(metrics.contextSizes)),
-    };
-
-    summaryResults.push(row);
+    });
   }
 
+  // Print Overall Ablation Table
   console.log("\n======================================================================");
-  console.log("                     FINAL ABLATION RESULTS TABLE                     ");
+  console.log("                     OVERALL ABLATION RESULTS TABLE                   ");
   console.log("======================================================================\n");
-  console.table(summaryResults);
+  console.table(overallResults);
+
+  // Print Category Breakdown Table
+  console.log("\n======================================================================");
+  console.log("             CATEGORY-BY-CATEGORY RECALL@3 BREAKDOWN                  ");
+  console.log("======================================================================\n");
+
+  const catRows = Object.entries(categoryBreakdown).map(([cat, configData]) => {
+    const row = { Category: cat };
+    ablationConfigs.forEach((c) => {
+      const recs = configData[c.name]?.recalls || [];
+      const avgRec = recs.length > 0 ? recs.reduce((a, b) => a + b, 0) / recs.length : 0;
+      const colName = c.name.split(". ")[1] || c.name;
+      row[colName] = `${Math.round(avgRec * 100)}%`;
+    });
+    return row;
+  });
+
+  console.table(catRows);
 }
 
 main().catch((err) => {
-  console.error("Evaluation error:", err);
+  console.error("Evaluation run failed:", err);
   process.exit(1);
 });
