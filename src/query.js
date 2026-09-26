@@ -11,48 +11,122 @@ const openai = new OpenAI({
 });
 
 /**
- * 1. Query Rewriter
- * Takes conversation history and the latest user query, then rewrites it
- * into an unambiguous, self-contained search query.
- *
- * Resolves anaphoras and pronouns ("it", "they", "that", "its", "the device")
- * using prior turns so hybrid search and BM25 can match keywords effectively.
+ * 1. Query Analyzer & Metadata Filter Extractor (Self-Query)
+ * Analyzes the user's natural language prompt and conversation context:
+ * - Rewrites the query to be standalone.
+ * - Extracts structured metadata constraints (pageNumber, year, documentType, source, author, section).
  */
-async function rewriteQuery(conversationHistory, latestQuery) {
-  if (!conversationHistory || conversationHistory.length === 0) {
-    return latestQuery;
-  }
-
+async function analyzeQueryAndExtractFilters(userQuery, conversationHistory = []) {
   const prompt = `
-You are a search query reformulation expert for a RAG retrieval system.
-Given the conversation history and a follow-up user query, rewrite the follow-up query into an independent, self-contained search query.
+You are an intelligent query analysis agent for a RAG retrieval system.
+Analyze the user's query and optional conversation history:
+1. "searchQuery": Rewrite the user's query into an unambiguous, clean search phrase for keyword & semantic matching (remove phrases like "from page 2", "in 2025 docs", and resolve pronouns like "it", "they").
+2. "filters": Extract any explicit metadata constraints mentioned or implied.
 
-Rules:
-1. Resolve all pronouns and ambiguous references ("it", "they", "its", "this setup", "that router") using details from the conversation.
-2. Include specific entity names, page numbers, technical terms, and acronyms mentioned earlier.
-3. Do NOT answer the question.
-4. Output ONLY the rewritten search query with no quotes, preamble, or commentary.
-5. If the query is already clear and self-contained, return it unchanged.
+Supported metadata filter attributes:
+- pageNumber: integer (e.g., 2 for "page 2", "second page")
+- year: integer (e.g., 2025, 2024)
+- documentType: string (e.g., "architecture", "lab-manual", "whitepaper", "specification")
+- source: string (e.g., "cn.pdf")
+- author: string
+- section: string
+
+Output JSON ONLY in this format:
+{
+  "searchQuery": "clean search terms",
+  "filters": {
+    "pageNumber": 2
+  }
+}
+If no metadata constraints are mentioned, "filters" should be {}.
 
 Conversation History:
 ${conversationHistory.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n")}
 
-User Follow-up Query: "${latestQuery}"
-Rewritten Standalone Query:`;
+User Query: "${userQuery}"
+`;
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0,
-    messages: [{ role: "user", content: prompt }],
-  });
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }],
+    });
 
-  const rewritten = response.choices[0].message.content.trim().replace(/^["']|["']$/g, "");
-  return rewritten;
+    const parsed = JSON.parse(response.choices[0].message.content);
+    return {
+      searchQuery: parsed.searchQuery || userQuery,
+      filters: parsed.filters || {},
+    };
+  } catch (err) {
+    console.warn("⚠️ Query analysis failed, proceeding without filters:", err.message);
+    return { searchQuery: userQuery, filters: {} };
+  }
 }
 
 /**
- * 2. Reciprocal Rank Fusion (RRF)
- * Merges multiple ranked lists into a unified list.
+ * 2. ChromaDB Filter Builder
+ * Converts a standard filter object into Chroma's 'where' query syntax.
+ * Single filter: { pageNumber: 2 }
+ * Multi filter:  { "$and": [{ pageNumber: 2 }, { year: 2025 }] }
+ */
+function buildChromaFilter(filters) {
+  if (!filters || Object.keys(filters).length === 0) {
+    return undefined;
+  }
+
+  const validEntries = Object.entries(filters).filter(
+    ([_, v]) => v !== undefined && v !== null && v !== ""
+  );
+
+  if (validEntries.length === 0) return undefined;
+
+  if (validEntries.length === 1) {
+    const [key, value] = validEntries[0];
+    return { [key]: value };
+  }
+
+  return {
+    "$and": validEntries.map(([key, value]) => ({ [key]: value })),
+  };
+}
+
+/**
+ * 3. BM25 Metadata Filter
+ * Filters the document set before indexing in BM25 based on metadata constraints.
+ */
+function filterDocuments(docs, filters) {
+  if (!filters || Object.keys(filters).length === 0) {
+    return docs;
+  }
+
+  const validEntries = Object.entries(filters).filter(
+    ([_, v]) => v !== undefined && v !== null && v !== ""
+  );
+
+  if (validEntries.length === 0) return docs;
+
+  const matched = docs.filter((doc) => {
+    return validEntries.every(([key, value]) => {
+      const docVal =
+        doc.metadata?.[key] ??
+        (key === "pageNumber" ? doc.metadata?.loc?.pageNumber : undefined);
+
+      if (docVal === undefined) return false;
+      if (typeof value === "string") {
+        return String(docVal).toLowerCase().includes(value.toLowerCase());
+      }
+      return docVal === value;
+    });
+  });
+
+  // If filter matched documents, constrain to them; otherwise fallback gracefully
+  return matched.length > 0 ? matched : docs;
+}
+
+/**
+ * 4. Reciprocal Rank Fusion (RRF)
  */
 function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
   const docMap = new Map();
@@ -84,8 +158,7 @@ function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
 }
 
 /**
- * 3. Cross-Encoder Reranker
- * Evaluates candidate chunks against the search query, assigning 0-100 relevance scores.
+ * 5. Cross-Encoder Reranker
  */
 async function rerankCandidates(query, candidates, topK = 5) {
   if (!candidates || candidates.length === 0) return [];
@@ -162,19 +235,33 @@ ${candidateExcerpts}
 }
 
 /**
- * 4. Main Conversational RAG Query Pipeline
+ * 6. Main Metadata-Aware Conversational RAG Pipeline
+ *
+ * @param {string} userQuery - Natural language query (e.g., "Find router setup from page 2")
+ * @param {Object} options
+ * @param {Array} [options.conversationHistory=[]] - Prior messages in the conversation
+ * @param {Object} [options.explicitFilters={}] - Manual override filters (e.g. { year: 2025, documentType: "architecture" })
  */
-export async function askQuestion(userQuery, conversationHistory = []) {
-  console.log(`\n===============================================================`);
-  console.log(`Original User Query: "${userQuery}"`);
-  console.log(`Conversation History Length: ${conversationHistory.length} turns`);
+export async function askQuestion(userQuery, options = {}) {
+  const { conversationHistory = [], explicitFilters = {} } = options;
 
-  // Step 1: Query Rewriter
-  const searchReadyQuery = await rewriteQuery(conversationHistory, userQuery);
-  console.log(`Rewritten Search Query: "${searchReadyQuery}"`);
+  console.log(`\n===============================================================`);
+  console.log(`User Query: "${userQuery}"`);
+
+  // Step 1: Query Analysis & Metadata Filter Extraction
+  const { searchQuery, filters: extractedFilters } = await analyzeQueryAndExtractFilters(
+    userQuery,
+    conversationHistory
+  );
+
+  // Merge extracted filters with any programmatic/explicit filters
+  const effectiveFilters = { ...extractedFilters, ...explicitFilters };
+
+  console.log(`Clean Search Query: "${searchQuery}"`);
+  console.log(`Active Metadata Filters:`, JSON.stringify(effectiveFilters));
   console.log(`---------------------------------------------------------------`);
 
-  // Step 2: Setup Hybrid Retrievers
+  // Step 2: Vector Store Setup & Filter Translation
   const embeddings = new OpenAIEmbeddings({
     modelName: "text-embedding-3-small",
     apiKey: process.env.OPENAI_API_KEY,
@@ -189,8 +276,10 @@ export async function askQuestion(userQuery, conversationHistory = []) {
     }),
   });
 
-  const vectorStoreRetriever = vectorStore.asRetriever({ k: 50 });
+  const chromaFilter = buildChromaFilter(effectiveFilters);
+  console.log(`Chroma 'where' constraint:`, chromaFilter ? JSON.stringify(chromaFilter) : "None");
 
+  // Step 3: Document Loading & Metadata-Filtered BM25 Setup
   const pdfPath = "documents/cn.pdf";
   const loader = new PDFLoader(pdfPath);
   const rawDocs = await loader.load();
@@ -203,23 +292,30 @@ export async function askQuestion(userQuery, conversationHistory = []) {
     },
   }));
 
-  const bm25Retriever = BM25Retriever.fromDocuments(sanitizedDocuments, { k: 50 });
+  // Apply metadata filter to candidate documents for BM25
+  const eligibleBM25Docs = filterDocuments(sanitizedDocuments, effectiveFilters);
+  console.log(`Eligible documents for BM25 after metadata filter: ${eligibleBM25Docs.length}/${sanitizedDocuments.length}`);
 
-  // Step 3: Hybrid Search (Vector + BM25) using rewritten query
-  console.log(`Executing Hybrid Search with: "${searchReadyQuery}"...`);
+  const bm25Retriever = BM25Retriever.fromDocuments(eligibleBM25Docs, { k: 50 });
+
+  // Step 4: Metadata-Aware Hybrid Retrieval (Vector + BM25)
+  console.log(`Executing filtered hybrid retrieval...`);
   const [vectorResults, bm25Results] = await Promise.all([
-    vectorStoreRetriever.invoke(searchReadyQuery),
-    bm25Retriever.invoke(searchReadyQuery),
+    vectorStore.similaritySearch(searchQuery, 50, chromaFilter),
+    bm25Retriever.invoke(searchQuery),
   ]);
 
-  // Step 4: RRF Fusion -> Candidate pool
+  console.log(`- Vector search returned: ${vectorResults.length} chunks (metadata constrained)`);
+  console.log(`- BM25 search returned: ${bm25Results.length} chunks (metadata constrained)`);
+
+  // Step 5: RRF Fusion
   const candidatePool = reciprocalRankFusion([vectorResults, bm25Results], 60, [0.5, 0.5]).slice(0, 50);
   console.log(`Candidate Pool size: ${candidatePool.length} chunks`);
 
-  // Step 5: Reranker -> Top 5
-  const topContextDocs = await rerankCandidates(searchReadyQuery, candidatePool, 5);
+  // Step 6: Reranker
+  const topContextDocs = await rerankCandidates(searchQuery, candidatePool, 5);
 
-  // Step 6: Final LLM Generation (incorporating conversation history + retrieved context)
+  // Step 7: Final LLM Generation
   const SYSTEM_PROMPT = `
 You are an expert assistant answering questions based on the provided document context and conversation history.
 Do not hallucinate or answer outside the provided context.
@@ -237,7 +333,6 @@ ${topContextDocs
   .join("\n\n")}
 `;
 
-  // Build message history for the final LLM response
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     ...conversationHistory,
@@ -256,7 +351,8 @@ ${topContextDocs
 
   return {
     answer,
-    searchQuery: searchReadyQuery,
+    searchQuery,
+    filters: effectiveFilters,
     sources: topContextDocs.map((d) => ({
       source: d.metadata?.source,
       pageNumber: d.metadata?.pageNumber ?? d.metadata?.loc?.pageNumber,
@@ -264,21 +360,9 @@ ${topContextDocs
   };
 }
 
-// Multi-turn Conversation Demo
-async function runDemo() {
-  const conversationHistory = [];
-
-  // Turn 1
-  const query1 = "What devices are being set up on page 2?";
-  const res1 = await askQuestion(query1, conversationHistory);
-  conversationHistory.push({ role: "user", content: query1 });
-  conversationHistory.push({ role: "assistant", content: res1.answer });
-
-  // Turn 2: Follow-up question with ambiguous pronoun "they"
-  const query2 = "How are they connected with each other?";
-  const res2 = await askQuestion(query2, conversationHistory);
-  conversationHistory.push({ role: "user", content: query2 });
-  conversationHistory.push({ role: "assistant", content: res2.answer });
+// Verification Test: Query with implicit metadata constraint
+async function runTest() {
+  await askQuestion("Find the router connection setup details from page 2");
 }
 
-runDemo();
+runTest();
