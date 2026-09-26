@@ -24,14 +24,18 @@ async function generateEmbeddingsForFile(filePath) {
     },
   }));
 
-  const vectorStore = await Chroma.fromDocuments(sanitizedDocuments, embeddings, {
-    collectionName: "pdf-qa",
-    index: new CloudClient({
-      apiKey: process.env.CHROMADB_API_KEY,
-      tenant: "ae7af065-af71-456d-8c9c-3127e359d578",
-      database: "pdf-qa",
-    }),
-  });
+  const vectorStore = await Chroma.fromDocuments(
+    sanitizedDocuments,
+    embeddings,
+    {
+      collectionName: "pdf-qa",
+      index: new CloudClient({
+        apiKey: process.env.CHROMADB_API_KEY,
+        tenant: "ae7af065-af71-456d-8c9c-3127e359d578",
+        database: "pdf-qa",
+      }),
+    },
+  );
 
   console.log(`All the documents are indexed into Chroma collection 'pdf-qa'.`);
   return vectorStore;

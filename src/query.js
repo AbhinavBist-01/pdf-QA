@@ -4,56 +4,12 @@ import { Chroma } from "@langchain/community/vectorstores/chroma";
 import { CloudClient } from "chromadb";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { BM25Retriever } from "@langchain/community/retrievers/bm25";
+import { reciprocalRankFusion } from "./rrf.js";
 import OpenAI from "openai";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-
-/**
- * Reciprocal Rank Fusion (RRF) algorithm
- * Combines multiple ranked lists into a single ranked list.
- *
- * Formula:
- * RRF_score(d) = Σ [ weight_i / (rank_i(d) + k) ]
- *
- * @param {Array<Array<any>>} rankingsList - Array of ranked document arrays [[doc1, doc2, ...], [docA, docB, ...]]
- * @param {number} k - Constant smoothing parameter (standard default: 60) to prevent top items from dominating
- * @param {Array<number>} weights - Relative weights for each ranking source (e.g., [0.5, 0.5])
- * @returns {Array<{ document: any, score: number, ranks: Object }>} Fused and sorted results
- */
-function reciprocalRankFusion(rankingsList, k = 60, weights = [0.5, 0.5]) {
-  const docMap = new Map(); // key -> { document, score, ranks }
-
-  rankingsList.forEach((ranking, listIdx) => {
-    const weight = weights[listIdx] ?? 1.0;
-
-    ranking.forEach((doc, rankIdx) => {
-      const rank = rankIdx + 1; // 1-based rank (1st, 2nd, 3rd, ...)
-      const rrfScore = weight / (rank + k);
-
-      // Create a unique key for deduplication based on content and source metadata
-      const source = doc.metadata?.source || "unknown";
-      const page = doc.metadata?.pageNumber ?? doc.metadata?.loc?.pageNumber ?? 0;
-      const key = `${source}::p${page}::${doc.pageContent.trim()}`;
-
-      if (!docMap.has(key)) {
-        docMap.set(key, {
-          document: doc,
-          score: 0,
-          ranks: {},
-        });
-      }
-
-      const entry = docMap.get(key);
-      entry.score += rrfScore;
-      entry.ranks[`source_${listIdx}`] = rank;
-    });
-  });
-
-  // Sort documents descending by total RRF score
-  return Array.from(docMap.values()).sort((a, b) => b.score - a.score);
-}
 
 async function query(userQuery) {
   console.log(`\n==================================================`);
@@ -90,7 +46,9 @@ async function query(userQuery) {
     },
   }));
 
-  const bm25Retriever = BM25Retriever.fromDocuments(sanitizedDocuments, { k: 5 });
+  const bm25Retriever = BM25Retriever.fromDocuments(sanitizedDocuments, {
+    k: 5,
+  });
 
   // 3. Run both retrievers in parallel
   console.log("Executing Vector Search & BM25 Keyword Search in parallel...");
@@ -105,15 +63,17 @@ async function query(userQuery) {
   // 4. Reciprocal Rank Fusion (RRF)
   const fusedItems = reciprocalRankFusion(
     [vectorResults, bm25Results],
-    60,         // smoothing constant (k)
-    [0.5, 0.5]  // 50% semantic, 50% keyword weight
+    60, // smoothing constant (k)
+    [0.5, 0.5], // 50% semantic, 50% keyword weight
   );
 
   console.log("\n--- Top Fused Chunks (RRF Scoring) ---");
   fusedItems.slice(0, 5).forEach((item, idx) => {
-    const page = item.document.metadata?.pageNumber ?? item.document.metadata?.loc?.pageNumber;
+    const page =
+      item.document.metadata?.pageNumber ??
+      item.document.metadata?.loc?.pageNumber;
     console.log(
-      `#${idx + 1} | Score: ${item.score.toFixed(5)} | Page: ${page} | Ranks: Vector=#${item.ranks.source_0 ?? "N/A"}, BM25=#${item.ranks.source_1 ?? "N/A"}`
+      `#${idx + 1} | Score: ${item.score.toFixed(5)} | Page: ${page} | Ranks: Vector=#${item.ranks.source_0 ?? "N/A"}, BM25=#${item.ranks.source_1 ?? "N/A"}`,
     );
   });
 
@@ -134,7 +94,7 @@ async function query(userQuery) {
           bookName: e.metadata?.source,
           pageContent: e.pageContent,
           pageNumber: e.metadata?.pageNumber ?? e.metadata?.loc?.pageNumber,
-        })
+        }),
       )
       .join("\n\n")}
   `;
@@ -148,7 +108,10 @@ async function query(userQuery) {
     ],
   });
 
-  console.log(`\n--- LLM Response ---\n`, llmResponse.choices[0].message.content);
+  console.log(
+    `\n--- LLM Response ---\n`,
+    llmResponse.choices[0].message.content,
+  );
   return llmResponse.choices[0].message.content;
 }
 
