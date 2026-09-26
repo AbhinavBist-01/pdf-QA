@@ -34,7 +34,7 @@ async function query(userQuery) {
     Always also answer the user concisely and state which page number that content is available on and the name/source of the document.
 
     User Documents:
-    ${results.map((e) => JSON.stringify({ bookName: e.metadata?.source, pageContent: e.pageContent, pageNumber: e.metadata?.loc?.pageNumber })).join("\n\n")}
+    ${results.map((e) => JSON.stringify({ bookName: e.metadata?.source, pageContent: e.pageContent, pageNumber: e.metadata?.pageNumber ?? e.metadata?.loc?.pageNumber })).join("\n\n")}
   `;
 
   const llmResponse = await openai.chat.completions.create({

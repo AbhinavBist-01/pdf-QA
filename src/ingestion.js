@@ -15,7 +15,16 @@ async function generateEmbeddingsForFile(filePath) {
     apiKey: process.env.OPENAI_API_KEY,
   });
 
-  const vectorStore = await Chroma.fromDocuments(documents, embeddings, {
+  const sanitizedDocuments = documents.map((doc) => ({
+    ...doc,
+    metadata: {
+      source: String(doc.metadata?.source || filePath),
+      pageNumber: Number(doc.metadata?.loc?.pageNumber || 1),
+      totalPages: Number(doc.metadata?.pdf?.totalPages || 1),
+    },
+  }));
+
+  const vectorStore = await Chroma.fromDocuments(sanitizedDocuments, embeddings, {
     collectionName: "pdf-qa",
     index: new CloudClient({
       apiKey: process.env.CHROMADB_API_KEY,
@@ -28,4 +37,4 @@ async function generateEmbeddingsForFile(filePath) {
   return vectorStore;
 }
 
-generateEmbeddingsForFile("documents/");
+generateEmbeddingsForFile("documents/cn.pdf");
