@@ -12,9 +12,6 @@ const openai = new OpenAI({
 
 /**
  * 1. Query Analyzer & Metadata Filter Extractor (Self-Query)
- * Analyzes the user's natural language prompt and conversation context:
- * - Rewrites the query to be standalone.
- * - Extracts structured metadata constraints (pageNumber, year, documentType, source, author, section).
  */
 async function analyzeQueryAndExtractFilters(userQuery, conversationHistory = []) {
   const prompt = `
@@ -67,9 +64,6 @@ User Query: "${userQuery}"
 
 /**
  * 2. ChromaDB Filter Builder
- * Converts a standard filter object into Chroma's 'where' query syntax.
- * Single filter: { pageNumber: 2 }
- * Multi filter:  { "$and": [{ pageNumber: 2 }, { year: 2025 }] }
  */
 function buildChromaFilter(filters) {
   if (!filters || Object.keys(filters).length === 0) {
@@ -94,7 +88,6 @@ function buildChromaFilter(filters) {
 
 /**
  * 3. BM25 Metadata Filter
- * Filters the document set before indexing in BM25 based on metadata constraints.
  */
 function filterDocuments(docs, filters) {
   if (!filters || Object.keys(filters).length === 0) {
@@ -121,7 +114,6 @@ function filterDocuments(docs, filters) {
     });
   });
 
-  // If filter matched documents, constrain to them; otherwise fallback gracefully
   return matched.length > 0 ? matched : docs;
 }
 
@@ -235,12 +227,95 @@ ${candidateExcerpts}
 }
 
 /**
- * 6. Main Metadata-Aware Conversational RAG Pipeline
+ * 6. Contextual Compression
+ * Takes retrieved top-K chunks and extracts ONLY the facts/sentences
+ * directly relevant to answering the query, removing fluff, headers, and noise.
  *
- * @param {string} userQuery - Natural language query (e.g., "Find router setup from page 2")
- * @param {Object} options
- * @param {Array} [options.conversationHistory=[]] - Prior messages in the conversation
- * @param {Object} [options.explicitFilters={}] - Manual override filters (e.g. { year: 2025, documentType: "architecture" })
+ * @param {string} query - The user search query
+ * @param {Array<Document>} documents - Top K retrieved chunks
+ * @returns {Promise<Array<{ pageContent: string, metadata: Object }>>} Compressed high-density context
+ */
+async function compressContext(query, documents) {
+  if (!documents || documents.length === 0) return [];
+
+  console.log(`\n--- Contextual Compression Stage ---`);
+  console.log(`Compressing ${documents.length} chunks to isolate query-relevant information...`);
+
+  const initialChars = documents.reduce((acc, d) => acc + d.pageContent.length, 0);
+
+  const prompt = `
+You are an expert context compression engine for a RAG retrieval system.
+User Query: "${query}"
+
+Your task:
+Carefully read each document chunk.
+1. Extract ONLY the exact facts, instructions, steps, numbers, and statements that directly help answer the query.
+2. Discard all boilerplate, extraneous descriptions, unrelated topics, headers, and filler.
+3. If an entire chunk has NO relevant information for the query, return null for that chunk.
+4. Keep the extracted text factual and concise without rewording or hallucinating.
+
+Output JSON ONLY in this format:
+{
+  "compressedChunks": [
+    {
+      "id": 0,
+      "compressedContent": "Extracted relevant statements only..."
+    }
+  ]
+}
+
+Input Chunks:
+${documents
+  .map((doc, idx) => {
+    const page = doc.metadata?.pageNumber ?? doc.metadata?.loc?.pageNumber ?? "?";
+    return `[Chunk ID ${idx}] (Page ${page}):\n${doc.pageContent}`;
+  })
+  .join("\n\n")}
+`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const parsed = JSON.parse(response.choices[0].message.content);
+    const compressedMap = new Map();
+    if (Array.isArray(parsed.compressedChunks)) {
+      for (const item of parsed.compressedChunks) {
+        if (item.compressedContent && item.compressedContent.trim().length > 0) {
+          compressedMap.set(item.id, item.compressedContent.trim());
+        }
+      }
+    }
+
+    const compressedDocs = [];
+    documents.forEach((doc, idx) => {
+      if (compressedMap.has(idx)) {
+        compressedDocs.push({
+          pageContent: compressedMap.get(idx),
+          metadata: doc.metadata,
+        });
+      }
+    });
+
+    const finalChars = compressedDocs.reduce((acc, d) => acc + d.pageContent.length, 0);
+    const reductionPercent = initialChars > 0 ? Math.round(((initialChars - finalChars) / initialChars) * 100) : 0;
+
+    console.log(`Compression result: ${initialChars} chars -> ${finalChars} chars (${reductionPercent}% noise removed)`);
+    console.log(`Retained ${compressedDocs.length}/${documents.length} high-density chunks.`);
+
+    return compressedDocs.length > 0 ? compressedDocs : documents;
+  } catch (err) {
+    console.warn("⚠️ Context compression failed, falling back to raw chunks:", err.message);
+    return documents;
+  }
+}
+
+/**
+ * 7. Main Conversational RAG Query Pipeline with Contextual Compression
  */
 export async function askQuestion(userQuery, options = {}) {
   const { conversationHistory = [], explicitFilters = {} } = options;
@@ -254,14 +329,13 @@ export async function askQuestion(userQuery, options = {}) {
     conversationHistory
   );
 
-  // Merge extracted filters with any programmatic/explicit filters
   const effectiveFilters = { ...extractedFilters, ...explicitFilters };
 
   console.log(`Clean Search Query: "${searchQuery}"`);
   console.log(`Active Metadata Filters:`, JSON.stringify(effectiveFilters));
   console.log(`---------------------------------------------------------------`);
 
-  // Step 2: Vector Store Setup & Filter Translation
+  // Step 2: Chroma Vector Store Setup
   const embeddings = new OpenAIEmbeddings({
     modelName: "text-embedding-3-small",
     apiKey: process.env.OPENAI_API_KEY,
@@ -277,7 +351,6 @@ export async function askQuestion(userQuery, options = {}) {
   });
 
   const chromaFilter = buildChromaFilter(effectiveFilters);
-  console.log(`Chroma 'where' constraint:`, chromaFilter ? JSON.stringify(chromaFilter) : "None");
 
   // Step 3: Document Loading & Metadata-Filtered BM25 Setup
   const pdfPath = "documents/cn.pdf";
@@ -292,37 +365,37 @@ export async function askQuestion(userQuery, options = {}) {
     },
   }));
 
-  // Apply metadata filter to candidate documents for BM25
   const eligibleBM25Docs = filterDocuments(sanitizedDocuments, effectiveFilters);
-  console.log(`Eligible documents for BM25 after metadata filter: ${eligibleBM25Docs.length}/${sanitizedDocuments.length}`);
-
   const bm25Retriever = BM25Retriever.fromDocuments(eligibleBM25Docs, { k: 50 });
 
-  // Step 4: Metadata-Aware Hybrid Retrieval (Vector + BM25)
+  // Step 4: Parallel Filtered Hybrid Retrieval
   console.log(`Executing filtered hybrid retrieval...`);
   const [vectorResults, bm25Results] = await Promise.all([
     vectorStore.similaritySearch(searchQuery, 50, chromaFilter),
     bm25Retriever.invoke(searchQuery),
   ]);
 
-  console.log(`- Vector search returned: ${vectorResults.length} chunks (metadata constrained)`);
-  console.log(`- BM25 search returned: ${bm25Results.length} chunks (metadata constrained)`);
+  console.log(`- Vector search returned: ${vectorResults.length} chunks`);
+  console.log(`- BM25 search returned: ${bm25Results.length} chunks`);
 
-  // Step 5: RRF Fusion
+  // Step 5: Reciprocal Rank Fusion (RRF)
   const candidatePool = reciprocalRankFusion([vectorResults, bm25Results], 60, [0.5, 0.5]).slice(0, 50);
   console.log(`Candidate Pool size: ${candidatePool.length} chunks`);
 
-  // Step 6: Reranker
-  const topContextDocs = await rerankCandidates(searchQuery, candidatePool, 5);
+  // Step 6: Reranker Stage -> Top 5 Chunks
+  const topRankedDocs = await rerankCandidates(searchQuery, candidatePool, 5);
 
-  // Step 7: Final LLM Generation
+  // Step 7: Contextual Compression -> Keep only query-relevant facts
+  const compressedContextDocs = await compressContext(searchQuery, topRankedDocs);
+
+  // Step 8: Final LLM Generation
   const SYSTEM_PROMPT = `
 You are an expert assistant answering questions based on the provided document context and conversation history.
 Do not hallucinate or answer outside the provided context.
 Always state the source document and page number where you found the answer.
 
-Context Documents:
-${topContextDocs
+Context Documents (Compressed to relevant facts only):
+${compressedContextDocs
   .map((doc) =>
     JSON.stringify({
       bookName: doc.metadata?.source,
@@ -346,23 +419,24 @@ ${topContextDocs
 
   const answer = llmResponse.choices[0].message.content;
 
-  console.log(`\nFinal LLM Response:\n${answer}`);
+  console.log(`\n===============================================================`);
+  console.log(`Final LLM Response:\n${answer}`);
   console.log(`===============================================================\n`);
 
   return {
     answer,
     searchQuery,
     filters: effectiveFilters,
-    sources: topContextDocs.map((d) => ({
+    sources: compressedContextDocs.map((d) => ({
       source: d.metadata?.source,
       pageNumber: d.metadata?.pageNumber ?? d.metadata?.loc?.pageNumber,
     })),
   };
 }
 
-// Verification Test: Query with implicit metadata constraint
+// Verification Test: Query with broad retrieved text compressed to exact answer
 async function runTest() {
-  await askQuestion("Find the router connection setup details from page 2");
+  await askQuestion("What cable type and router interface are used to connect the PC?");
 }
 
 runTest();
