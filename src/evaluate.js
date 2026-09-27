@@ -185,7 +185,7 @@ function evaluateCitationCorrectness(generatedAnswer, relevantPages) {
   return pageMatches.some((p) => relevantPages.includes(p)) ? 1 : 0;
 }
 
-function computeRankingMetrics(retrievedDocs, targetFile, relevantPages) {
+function computeRankingMetrics(retrievedDocs, testItem) {
   let hasRelevant = false;
   let mrr = 0;
 
@@ -193,11 +193,13 @@ function computeRankingMetrics(retrievedDocs, targetFile, relevantPages) {
     const d = retrievedDocs[i];
     const docFile = d.metadata?.fileName || d.metadata?.source || "";
     const docPage = d.metadata?.pageNumber;
+    const docText = (d.pageContent || "").toLowerCase();
 
-    const fileMatches = !targetFile || docFile.toLowerCase().includes(targetFile.toLowerCase());
-    const pageMatches = !relevantPages || relevantPages.length === 0 || relevantPages.includes(docPage);
+    const fileMatches = !testItem.targetFile || docFile.toLowerCase().includes(testItem.targetFile.toLowerCase());
+    const pageMatches = testItem.relevantPages && testItem.relevantPages.includes(docPage);
+    const termMatches = testItem.relevantTerms && testItem.relevantTerms.some((t) => docText.includes(t.toLowerCase()));
 
-    if (fileMatches && pageMatches) {
+    if (fileMatches && (pageMatches || termMatches)) {
       if (!hasRelevant) {
         hasRelevant = true;
         mrr = 1 / (i + 1);
@@ -263,7 +265,7 @@ async function runRAGPipeline(testItem, config, resources) {
   }
 
   // Measure ranking metrics at top 3
-  const { recall, mrr } = computeRankingMetrics(retrievedDocs.slice(0, 3), testItem.targetFile, testItem.relevantPages);
+  const { recall, mrr } = computeRankingMetrics(retrievedDocs.slice(0, 3), testItem);
 
   // 3. Reranker
   let candidateDocs = retrievedDocs.slice(0, 3);
@@ -342,7 +344,16 @@ async function main() {
   }
   if (limitArgIdx !== -1 && args[limitArgIdx + 1]) {
     const limit = parseInt(args[limitArgIdx + 1], 10);
-    if (!isNaN(limit)) testDataset = testDataset.slice(0, limit);
+    if (!isNaN(limit)) {
+      const categories = [...new Set(testDataset.map((d) => d.category))];
+      const perCat = Math.max(1, Math.ceil(limit / categories.length));
+      const balanced = [];
+      categories.forEach((cat) => {
+        const catItems = testDataset.filter((d) => d.category === cat);
+        balanced.push(...catItems.slice(0, perCat));
+      });
+      testDataset = balanced.slice(0, limit);
+    }
   }
 
   console.log(`Corpus: documents/48 laws.pdf (651 pages) + documents/cn.pdf (5 pages)`);

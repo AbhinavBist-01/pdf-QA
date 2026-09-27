@@ -25,7 +25,8 @@ export const EVAL_DATASET = [
     question: "What is Law 1 in The 48 Laws of Power?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [24],
+    relevantPages: [2, 24, 25],
+    relevantTerms: ["Never Outshine", "outshine the master"],
     expectedAnswer: "Law 1 is 'Never Outshine the Master'. Always make those above you feel comfortably superior.",
   },
   {
@@ -34,7 +35,8 @@ export const EVAL_DATASET = [
     question: "Who was King Louis XIV's finance minister who transgressed Law 1 by throwing an extravagant party at Vaux-le-Vicomte?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [24, 25],
+    relevantPages: [24, 25, 26],
+    relevantTerms: ["Fouquet", "Vaux-le-Vicomte"],
     expectedAnswer: "Nicolas Fouquet.",
   },
   {
@@ -43,7 +45,8 @@ export const EVAL_DATASET = [
     question: "What is Law 2 in The 48 Laws of Power?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [31],
+    relevantPages: [2, 33, 34],
+    relevantTerms: ["Never Put Too Much Trust in Friends", "Use Enemies"],
     expectedAnswer: "Law 2 is 'Never Put Too Much Trust in Friends, Learn How to Use Enemies'.",
   },
   {
@@ -52,7 +55,8 @@ export const EVAL_DATASET = [
     question: "What is Law 3 in The 48 Laws of Power?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [39],
+    relevantPages: [2, 42, 43],
+    relevantTerms: ["Conceal Your Intentions"],
     expectedAnswer: "Law 3 is 'Conceal Your Intentions'.",
   },
   {
@@ -61,7 +65,8 @@ export const EVAL_DATASET = [
     question: "What is Law 4 in The 48 Laws of Power?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [52],
+    relevantPages: [2, 3, 55, 56],
+    relevantTerms: ["Say Less Than Necessary"],
     expectedAnswer: "Law 4 is 'Always Say Less Than Necessary'.",
   },
   {
@@ -70,7 +75,8 @@ export const EVAL_DATASET = [
     question: "According to Law 4, what happens when you try to impress people with words?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [52],
+    relevantPages: [3, 55, 56],
+    relevantTerms: ["impress", "more you say", "less in control"],
     expectedAnswer: "The more you say, the more common you appear, and the less in control.",
   },
   {
@@ -79,7 +85,8 @@ export const EVAL_DATASET = [
     question: "What is Law 5 in The 48 Laws of Power regarding reputation?",
     conversationHistory: [],
     targetFile: "48 laws.pdf",
-    relevantPages: [58],
+    relevantPages: [3, 61, 62],
+    relevantTerms: ["Reputation", "Guard It"],
     expectedAnswer: "Law 5 is 'So Much Depends on Reputation—Guard It with Your Life'.",
   },
   {
